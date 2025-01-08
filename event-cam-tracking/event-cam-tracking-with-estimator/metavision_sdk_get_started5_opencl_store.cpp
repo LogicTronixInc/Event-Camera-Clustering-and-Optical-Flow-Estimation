@@ -1,0 +1,601 @@
+#include <metavision/sdk/driver/camera.h>
+#include <metavision/sdk/base/events/event_cd.h>
+
+#include <fstream>
+#include <functional>
+#include <thread>
+#include <boost/program_options.hpp>
+#include <opencv2/opencv.hpp>
+#include <metavision/sdk/base/utils/log.h>
+#include <metavision/sdk/core/algorithms/event_buffer_reslicer_algorithm.h>
+#include <metavision/sdk/core/algorithms/event_frame_diff_generation_algorithm.h>
+#include <metavision/sdk/core/algorithms/event_frame_histo_generation_algorithm.h>
+#include <metavision/hal/facilities/i_hw_identification.h>
+#include <metavision/sdk/driver/camera.h>
+#include <metavision/sdk/ui/utils/window.h>
+#include <metavision/sdk/ui/utils/event_loop.h>
+
+#include <CL/cl.h>
+#include <CL/cl.hpp>
+
+#define _CRT_SECURE_NO_WARNINGS
+#define PROGRAM_FILE "coordinate_processor.cl"
+
+#include "AEClustering.h"
+
+// #define ARRAY_SIZE 4096
+#define NUM_KERNELS 1
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+// Maximum number of coordinates to process
+const int ARRAY_SIZE = 16384;
+const int MAX_COORDINATES = 10000;
+const int WIDTH = 1280;
+const int HEIGHT = 720;
+const int MAX_HASH_SIZE = 16384; // Should be power of 2, larger than expected unique coordinates
+
+AEClustering *eclustering(new AEClustering);
+
+/* Find a GPU or CPU associated with the first available platform
+
+The `platform` structure identifies the first platform identified by the
+OpenCL runtime. A platform identifies a vendor's installation, so a system
+may have an NVIDIA platform and an AMD platform.
+
+The `device` structure corresponds to the first accessible device
+associated with the platform. Because the second parameter is
+`CL_DEVICE_TYPE_GPU`, this device must be a GPU.
+*/
+/* Find a GPU or CPU associated with the first available platform */
+cl_device_id create_device()
+{
+
+    cl_platform_id platform;
+    cl_device_id dev;
+    int err;
+
+    /* Identify a platform */
+    err = clGetPlatformIDs(1, &platform, NULL);
+    if (err < 0)
+    {
+        perror("Couldn't identify a platform");
+        exit(1);
+    }
+
+    /* Access a device */
+    err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &dev, NULL);
+    // err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &dev, NULL);
+    if (err == CL_DEVICE_NOT_FOUND)
+    {
+        err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &dev, NULL);
+    }
+    if (err < 0)
+    {
+        perror("Couldn't access any devices");
+        exit(1);
+    }
+
+    return dev;
+}
+
+/* Create program from a file and compile it */
+cl_program build_program(cl_context ctx, cl_device_id dev, const char *filename)
+{
+
+    cl_program program;
+    FILE *program_handle;
+    char *program_buffer, *program_log;
+    size_t program_size, log_size;
+    int err;
+
+    /* Read program file and place content into buffer */
+    program_handle = fopen(filename, "r");
+    if (program_handle == NULL)
+    {
+        perror("Couldn't find the program file");
+        exit(1);
+    }
+    fseek(program_handle, 0, SEEK_END);
+    program_size = ftell(program_handle);
+    rewind(program_handle);
+    program_buffer = (char *)malloc(program_size + 1);
+    program_buffer[program_size] = '\0';
+    fread(program_buffer, sizeof(char), program_size, program_handle);
+    fclose(program_handle);
+
+    /* Create program from file */
+    program = clCreateProgramWithSource(ctx, 1,
+                                        (const char **)&program_buffer, &program_size, &err);
+    if (err < 0)
+    {
+        perror("Couldn't create the program");
+        exit(1);
+    }
+    free(program_buffer);
+
+    /* Build program */
+    err = clBuildProgram(program, 0, NULL, NULL, NULL, NULL);
+    if (err < 0)
+    {
+
+        /* Find size of log and print to std output */
+        clGetProgramBuildInfo(program, dev, CL_PROGRAM_BUILD_LOG,
+                              0, NULL, &log_size);
+        program_log = (char *)malloc(log_size + 1);
+        program_log[log_size] = '\0';
+        clGetProgramBuildInfo(program, dev, CL_PROGRAM_BUILD_LOG,
+                              log_size + 1, program_log, NULL);
+        printf("%s\n", program_log);
+        free(program_log);
+        exit(1);
+    }
+
+    return program;
+}
+// this function will be associated to the camera callback
+void count_events(const Metavision::EventCD *begin, const Metavision::EventCD *end)
+{
+    int counter = 0;
+
+    // this loop allows us to get access to each event received in this callback
+    for (const Metavision::EventCD *ev = begin; ev != end; ++ev)
+    {
+        ++counter; // count each event
+
+        // print each event
+        std::cout << "Event received: coordinates (" << ev->x << ", " << ev->y << "), t: " << ev->t
+                  << ", polarity: " << ev->p << std::endl;
+    }
+
+    // report
+    std::cout << "There were " << counter << " events in this callback" << std::endl;
+}
+
+void print_timestamp_main(char *info, char *func)
+{
+    char print_info[20];
+
+    auto now_b = std::chrono::system_clock::now();
+
+    // Convert the current time to time since epoch
+    auto duration_b = now_b.time_since_epoch();
+
+    // Convert duration to milliseconds
+    auto milliseconds_b = std::chrono::duration_cast<std::chrono::microseconds>(
+                              duration_b)
+                              .count();
+
+    // Print the result
+    std::cout << func << " : Current time in milliseconds in " << info << "call is: "
+              << milliseconds_b << std::endl;
+}
+
+// main loop
+int main(int argc, char *argv[])
+{
+    // std::string event_file_path, out_file_path, out_video_path;
+
+    int nevents = ARRAY_SIZE;
+
+    char file_name[100];
+    int frame_count = 0;
+
+    double centroid_prev[16384][2];
+
+    for (int i=0; i<16384; i++){
+        centroid_prev[i][0] = 0;
+        centroid_prev[i][1] = 0;
+    }
+
+    /* OpenCL structures */
+    cl_device_id device;
+    cl_context context;
+    cl_program program;
+    cl_kernel kernel;
+    cl_command_queue queue;
+    cl_event prof_event;
+    cl_int i, j, err;
+    size_t local_size, global_size;
+    cl_ulong time_start, time_end, total_time;
+    char kernel_names[NUM_KERNELS][24] =
+        {"process_coordinates"};
+
+    /* Data and buffers */
+    int data[ARRAY_SIZE];
+    printf("Data stored\n");
+    for (int i = 0; i < ARRAY_SIZE; i++)
+    {
+
+        data[i] = 0;
+    }
+    printf("\n");
+
+    /* Create device and determine local size */
+    device = create_device();
+    err = clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE,
+                          sizeof(local_size), &local_size, NULL);
+    printf("local size : %d \n", local_size);
+    local_size = 1024;
+    if (err < 0)
+    {
+        perror("Couldn't obtain device information");
+        exit(1);
+    }
+
+    /* Allocate and initialize output arrays */
+    // num_groups = ARRAY_SIZE / local_size;
+
+    // assign = (unsigned int *)malloc(32 * sizeof(unsigned int));
+    // scalar_sum = (float *)malloc(num_groups * sizeof(float));
+
+    /* Create a context */
+    context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
+    if (err < 0)
+    {
+        perror("Couldn't create a context");
+        exit(1);
+    }
+
+    /* Build program */
+    program = build_program(context, device, PROGRAM_FILE);
+
+    // Prepare output buffers
+    std::vector<int> repeatedCoords(MAX_COORDINATES);
+    std::vector<int> uniqueCoords(MAX_COORDINATES);
+    int repeatedCount = 0;
+    int uniqueCount = 0;
+    int uniqueCount_prev = 0;
+    int uniqueCount_diff = 0;
+
+    // Create OpenCL buffers
+    // cl::Buffer inputBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+    //                        coordinates.size() * sizeof(int), coordinates.data());
+    // cl::Buffer repeatedBuffer(context, CL_MEM_WRITE_ONLY,
+    //                           repeatedCoords.size() * sizeof(int));
+    // cl::Buffer uniqueBuffer(context, CL_MEM_WRITE_ONLY,
+    //                         uniqueCoords.size() * sizeof(int));
+    // cl::Buffer repeatedCountBuffer(context, CL_MEM_WRITE_ONLY, sizeof(int));
+    // cl::Buffer uniqueCountBuffer(context, CL_MEM_READ_WRITE, sizeof(int));
+    cl_mem inputBuffer = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, ARRAY_SIZE * sizeof(int), data, &err);
+    cl_mem repeatedBuffer = clCreateBuffer(context, CL_MEM_WRITE_ONLY, ARRAY_SIZE * sizeof(int), NULL, &err);
+    cl_mem uniqueBuffer = clCreateBuffer(context, CL_MEM_WRITE_ONLY, ARRAY_SIZE * sizeof(int), NULL, &err);
+    cl_mem repeatedCountBuffer = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(int), NULL, &err);
+    cl_mem uniqueCountBuffer = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int), NULL, &err);
+
+    if (err < 0)
+    {
+        perror("Couldn't create a buffer");
+        exit(1);
+    };
+
+    /* Create a command queue */
+    queue = clCreateCommandQueue(context, device,
+                                 CL_QUEUE_PROFILING_ENABLE, &err);
+    if (err < 0)
+    {
+        perror("Couldn't create a command queue");
+        exit(1);
+    };
+
+    kernel = clCreateKernel(program, kernel_names[0], &err);
+    if (err < 0)
+    {
+        perror("Couldn't create a kernel");
+        exit(1);
+    };
+
+    // Set kernel arguments
+    // kernel.setArg(0, inputBuffer);
+    // kernel.setArg(1, repeatedBuffer);
+    // kernel.setArg(2, uniqueBuffer);
+    // kernel.setArg(3, repeatedCountBuffer);
+    // kernel.setArg(4, uniqueCountBuffer);
+    // kernel.setArg(5, ARRAY_SIZE);
+    // kernel.setArg(6, WIDTH);
+    // kernel.setArg(7, HEIGHT);
+    clSetKernelArg(kernel, 0, sizeof(cl_mem), &inputBuffer);
+    clSetKernelArg(kernel, 1, sizeof(cl_mem), &repeatedBuffer);
+    clSetKernelArg(kernel, 2, sizeof(cl_mem), &uniqueBuffer);
+    clSetKernelArg(kernel, 3, sizeof(cl_mem), &repeatedCountBuffer);
+    clSetKernelArg(kernel, 4, sizeof(cl_mem), &uniqueCountBuffer);
+    clSetKernelArg(kernel, 5, sizeof(int), &ARRAY_SIZE);
+    clSetKernelArg(kernel, 6, sizeof(int), &WIDTH);
+    clSetKernelArg(kernel, 7, sizeof(int), &HEIGHT);
+
+    // Execute kernel
+    cl::NDRange globalSize(1024); // Adjust based on your device capabilities
+    cl::NDRange localSize(1024);  // Adjust based on device local work group size
+    global_size = 1024;
+    local_size = 1024;
+    // queue.enqueueNDRangeKernel(kernel, cl::NullRange, globalSize, localSize);
+
+    err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_size,
+                                 &local_size, 0, NULL, &prof_event);
+    if (err < 0)
+    {
+        perror("Couldn't enqueue the kernel");
+        exit(1);
+    }
+
+    /* Finish processing the queue and get profiling information */
+    clFinish(queue);
+
+    /**************end of OpenCL kernel config ************************/
+    Metavision::timestamp period_us = 50000, min_generation_period_us = 10000;
+
+    Metavision::Camera cam; // create the camera
+
+    if (argc >= 2)
+    {
+        // if we passed a file path, open it
+        cam = Metavision::Camera::from_file(argv[1]);
+    }
+    else
+    {
+        // open the first available camera
+        cam = Metavision::Camera::from_first_available();
+    }
+
+    const int camera_width = cam.geometry().width();
+    const int camera_height = cam.geometry().height();
+    const int npixels = camera_width * camera_height;
+
+    // Instantiate event reslicer and define its slicing & event callbacks
+    Metavision::EventBufferReslicerAlgorithm::Condition condition;
+    // condition = Metavision::EventBufferReslicerAlgorithm::Condition::make_n_events(nevents);
+    condition = Metavision::EventBufferReslicerAlgorithm::Condition::make_n_us(period_us);
+    Metavision::EventBufferReslicerAlgorithm reslicer(nullptr, condition);
+
+    int data_index = 0;
+
+    // Predefined colors for different clusters
+    std::vector<cv::Scalar> colors = {
+        cv::Scalar(255, 0, 0),     // Blue
+        cv::Scalar(0, 255, 0),     // Green
+        cv::Scalar(0, 0, 255),     // Red
+        cv::Scalar(255, 255, 0),   // Cyan
+        cv::Scalar(255, 0, 255),   // Magenta
+        cv::Scalar(0, 255, 255),   // Yellow
+        cv::Scalar(128, 0, 0),     // Dark Blue
+        cv::Scalar(0, 128, 0),     // Dark Green
+        cv::Scalar(0, 0, 128),     // Dark Red
+        cv::Scalar(128, 128, 0)    // Dark Cyan
+    };
+
+    reslicer.set_on_new_slice_callback([&](Metavision::EventBufferReslicerAlgorithm::ConditionStatus status,
+                                           Metavision::timestamp ts, std::size_t nevents)
+                                       {
+                                           print_timestamp_main("start of reslicing ", "main: ");
+                                           //    std::cout << "number of events : " << nevents << std::endl;
+                                           //    // push event data to queue
+                                           //    for (int i = 4000; i < 4095; i++)
+                                           //    {
+                                           //        std::cout << "," << data[i];
+                                           //    }
+                                           //    std::cout << std::endl;
+
+                                           //    data_buffer = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, ARRAY_SIZE * sizeof(float), data, &err);
+                                        //   inputBuffer = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, ARRAY_SIZE * sizeof(int), data, &err);
+                                          int counter = 0;
+                                          std::deque<double> ev_data(4, 0.0);
+                                          cv::Mat cluster_img(camera_height, camera_width, CV_8UC3);
+                                          cluster_img.setTo(cv::Scalar::all(0));
+
+                                       
+                                            int minN = eclustering->getMinN();     
+                                            for (auto cc : eclustering->clusters){
+                                                std::cout << "Event cluster ID : " << cc.getClusterId() << std::endl;
+                                                
+                                                std::cout << "Event cluster numbers : " << cc.getN() << std::endl;
+                                                
+                                                if (cc.getN() >= minN){
+                                                    Eigen::VectorXd cen(cc.getClusterCentroid());
+
+                                                    Eigen::VectorXd cen_prev(cc.getMuPrev());
+
+                                                    int cluster_ID = cc.getClusterId();
+
+                                                    if (cluster_ID>16384){
+                                                        cluster_ID = cluster_ID%16384;
+                                                    }
+
+                                                                
+                                                    std::cout << "Centroid size : " << cen.size() << std::endl;
+                                                    std::cout << "(" << cen[0] << " , " << cen[1] << ")" << "," ; 
+                                                    cv::circle(cluster_img,cv::Point(cen[0],cen[1]), 1, cv::Scalar(0,255,0,255), -1);
+                                                    std::cout << "Centroid previous size : " << cen_prev.size() << std::endl;
+                                                    std::cout << "after initial get(" << centroid_prev[cluster_ID][0] << " , " << centroid_prev[cluster_ID][1] << ")" << "," ; 
+                                                    
+                                                    cv::circle(cluster_img,cv::Point(centroid_prev[cluster_ID][0],centroid_prev[cluster_ID][1]), 1, cv::Scalar(0,0,255,255), -1);
+
+                                                    
+                                                    std::deque<Eigen::VectorXd> cluster_data = cc.getDat(); 
+                                                    std::cout << "cluster data size : " << cluster_data.size() << std::endl;
+                                                    
+                                                    cv::Scalar color = colors[cc.getClusterId() % colors.size()];
+
+                                                    for (auto cdata : cluster_data){
+                                                            std::cout << "(" << cdata[0] << " , " << cdata[1] << ")" << "," ; 
+                                                            cv::circle(cluster_img,cv::Point(cdata[0],cdata[1]), 1, color, -1);
+
+                                                        }
+
+                                                    int font_size = 1;//Declaring the font size//
+                                                    cv::Scalar font_Color(255, 0, 0);//Declaring the color of the font//
+                                                    int font_weight = 2;//Declaring the font weight//
+                                                    std::string str_clusterID = std::to_string(cc.getClusterId());
+
+                                                    // cv::putText(cluster_img, str_clusterID, cv::Point(cen[0]+10,cen[1]+10),cv::FONT_HERSHEY_COMPLEX, font_size,font_Color, font_weight);
+                                                    double centroid_diff_x = cen[0] - centroid_prev[cluster_ID][0];
+                                                    double centroid_diff_y = cen[1] - centroid_prev[cluster_ID][1];
+
+                                                    std::cout << centroid_diff_x << "," << centroid_diff_y << std::endl;
+                                                    if (centroid_prev[cluster_ID][0]>0 && centroid_prev[cluster_ID][1]>0){
+                                                        cv::arrowedLine(cluster_img, cv::Point(centroid_prev[cluster_ID][0], centroid_prev[cluster_ID][1] ), 
+                                                                    cv::Point((centroid_prev[cluster_ID][0]+centroid_diff_x*3), (centroid_prev[cluster_ID][1]+centroid_diff_y*3)),
+                                                                        cv::Scalar(0, 255, 0), 2, cv::LINE_8);
+                                                    }
+                                                    
+                                                    // cv::arrowedLine(cluster_img, cv::Point(100, 100), cv::Point(200,200), cv::Scalar(255, 0, 0), 2, cv::LINE_8);    
+                                                    cc.setMuPrev(cen);
+
+                                                    centroid_prev[cluster_ID][0] = cen[0];
+                                                    centroid_prev[cluster_ID][1] = cen[1];
+
+                                                    cen_prev = cc.getMuPrev();
+                                                    std::cout << "after set (" << cen_prev[0] << " , " << cen_prev[1] << ")" << "," ;
+
+                                                   
+
+
+
+                                                    // if (cc.getClusterId() % 2 == 0){
+                                                    //     int cluster_color = cc.getClusterId() % 255;
+                                                    //     for (auto cdata : cluster_data){
+                                                    //         std::cout << "(" << cdata[0] << " , " << cdata[1] << ")" << "," ; 
+                                                    //         cv::circle(cluster_img,cv::Point(cdata[0],cdata[1]), 1, cv::Scalar(0,0,cluster_color,255), -1);
+
+                                                    //     }
+                                                    // }
+
+                                                    // if (cc.getClusterId() % 2 != 0){
+                                                    //     int cluster_color_even = cc.getClusterId() % 255;
+                                                    //     for (auto cdata : cluster_data){
+                                                    //         std::cout << "(" << cdata[0] << " , " << cdata[1] << ")" << "," ; 
+                                                    //         cv::circle(cluster_img,cv::Point(cdata[0],cdata[1]), 1, cv::Scalar(0,cluster_color_even,0,255), -1);
+
+                                                    //     }
+                                                    // }
+                                                
+                                                }
+                                                // clusterID++;
+                                                
+
+                                            }
+                                            std::cout<<std::endl;
+
+                                            for (int i = 0; i < ARRAY_SIZE; i+=8)
+                                            {                                             
+                                           
+                                                cv::circle(cluster_img,cv::Point(data[i],data[i+1]), 1, cv::Scalar(0,0,255,255), -1);
+                                            }
+
+                                            uniqueCount_prev = uniqueCount;
+
+
+
+                                            sprintf(file_name, "cluster_frame_combined%d.jpg", frame_count+1);
+                                            cv::imwrite(file_name, cluster_img);
+                                            cv::imshow("Image", cluster_img);
+                                            cv::waitKey(1);
+                                            cluster_img.release();
+                                            frame_count++;
+                                          
+                                           /*************Start of cluster assignment kernel**************/ });
+
+    auto aggregate_events_fct = [&](const Metavision::EventCD *begin, const Metavision::EventCD *end)
+    {
+        int counter = 0;
+
+        // this loop allows us to get access to each event received in this callback
+        for (const Metavision::EventCD *ev = begin; ev != end; ++ev)
+        {
+            ++counter; // count each event
+            // if (data_index == 0)
+            // {
+            //     std::cout << "First Event received : coordinates (" << ev->x << ", " << ev->y << "), t: " << ev->t
+            //               << ", polarity: " << ev->p << std::endl;
+            // }
+
+            // print each event
+            // std::cout << "Event received: coordinates (" << ev->x << ", " << ev->y << "), t: " << ev->t
+            //   << ", polarity: " << ev->p << std::endl;
+            data[data_index] = ev->x;
+            // std::cout << "data stored at" << data_index << ":" << data[data_index] << " data x:" << ev->x << std::endl;
+            data_index++;
+            data[data_index] = ev->y;
+            // std::cout << "data stored at" << data_index << ":" << data[data_index] << " data y:" << ev->y << std::endl;
+
+            data_index++;
+            if (data_index > ARRAY_SIZE - 1)
+            {
+                data_index = 0;
+                // std::cout << "Last Event received : coordinates (" << ev->x << ", " << ev->y << "), t: " << ev->t
+                //               << ", polarity: " << ev->p << std::endl;
+            }
+
+            // if (data_index == 4095)
+            // {
+            //     std::cout << "Last Event received : coordinates (" << ev->x << ", " << ev->y << "), t: " << ev->t
+            //               << ", polarity: " << ev->p << std::endl;
+            // }
+        }
+
+        // report
+        // std::cout << "There were " << counter << " events in this callback" << std::endl;
+        // std::cout << "data_index " << data_index << std::endl;
+
+         //   printf("data at index 16383 : %d\n", data[16383]);
+        
+         std::deque<double> ev_data(4, 0.0);
+        for (const Metavision::EventCD *ev = begin; ev != end; ++ev) {
+            ++counter; // count each event
+
+            // print each event
+            // std::cout << "Event received: coordinates (" << ev->x << ", " << ev->y << "), t: " << ev->t
+            //           << ", polarity: " << ev->p << std::endl;
+            // ev_data[0] = (ev->t)/1000000.0;       
+            // ev_data[1] = ev->x;
+            // ev_data[2] = ev->y;
+            // ev_data[3] = ev->p;
+            // // std::cout << "timestamp into buffer: " << ev_data[0] << std::endl;
+            // eclustering->update(ev_data);
+            if ((counter%512)==0){ //downsampling sample by 32
+                ev_data[0] = (ev->t)/1000000.0;       
+                ev_data[1] = ev->x;
+                ev_data[2] = ev->y;
+                ev_data[3] = ev->p;
+                // std::cout << "timestamp into buffer: " << ev_data[0] << std::endl;
+                eclustering->update(ev_data);
+            }
+
+        }
+
+    };
+
+    // Set the event processing callback
+    cam.cd().add_callback([&](const Metavision::EventCD *begin, const Metavision::EventCD *end)
+                          { reslicer.process_events(begin, end, aggregate_events_fct); });
+
+    // start the camera
+    cam.start();
+
+    // keep running while the camera is on or the recording is not finished
+    while (cam.is_running())
+    {
+        std::this_thread::yield();
+    }
+
+    // the recording is finished, stop the camera.
+    // Note: we will never get here with a live camera
+    cam.stop();
+
+    /* Deallocate event */
+    clReleaseEvent(prof_event);
+
+    clReleaseKernel(kernel);
+
+    // clReleaseMemObject(output_buffer);
+    // clReleaseMemObject(data_buffer);
+    clReleaseCommandQueue(queue);
+    clReleaseProgram(program);
+    clReleaseContext(context);
+    return 0;
+
+    // return 0;
+}

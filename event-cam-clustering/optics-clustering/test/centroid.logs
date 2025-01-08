@@ -1,0 +1,92 @@
+13-14
+Cluster size : 28
+cluster 0 size : 59
+cluster 1 size : 375
+cluster 2 size : 178
+
+Centroid X : 639.61
+Centroid Y : 240.559
+ cl 1 375
+Centroid X : 523.496
+Centroid Y : 275.824
+ cl 2 178
+Centroid X : 682.685
+Centroid Y : 255.067
+ cl 3 1
+
+ 17-18
+ Cluster size : 26
+cluster 0 size : 212
+cluster 1 size : 386
+cluster 2 size : 2
+
+cluster points size : 26
+ cl 0 212
+Centroid X : 675.689
+Centroid Y : 254.986
+ cl 1 386
+Centroid X : 520.632
+Centroid Y : 275.578
+ cl 2 2
+Centroid X : 513
+Centroid Y : 283
+
+19 -020
+Cluster size : 27
+cluster 0 size : 372
+cluster 1 size : 1
+cluster 2 size : 142
+cluster 3 size : 83
+cluster 4 size : 4
+cluster 5 size : 1
+
+cl 0 372
+Centroid X : 517.742
+Centroid Y : 276.656
+ cl 1 1
+Centroid X : 1008
+Centroid Y : 38
+ cl 2 142
+Centroid X : 675.232
+Centroid Y : 235.225
+ cl 3 83
+Centroid X : 677.494
+Centroid Y : 281.217
+ cl 4 4
+
+ with reach 15:
+ Cluster size : 20
+cluster 0 size : 375
+cluster 1 size : 1
+cluster 2 size : 239
+cluster 3 size : 4
+
+cluster points size : 20
+ cl 0 375
+Centroid X : 517.192
+Centroid Y : 276.752
+ cl 1 1
+Centroid X : 1008
+Centroid Y : 38
+ cl 2 239
+Centroid X : 672.95
+Centroid Y : 252.485
+ cl 3 4
+
+ 21-22
+Cluster size : 24
+cluster 0 size : 410
+cluster 1 size : 203
+cluster 2 size : 1
+
+cl 0 410
+Centroid X : 520.151
+Centroid Y : 273.871
+ cl 1 203
+Centroid X : 673.409
+Centroid Y : 251.138
+ cl 2 1
+
+
+
+
