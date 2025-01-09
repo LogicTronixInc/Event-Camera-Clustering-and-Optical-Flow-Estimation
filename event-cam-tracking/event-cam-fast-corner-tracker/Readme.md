@@ -1,4 +1,3 @@
-
 # Event Camera Tracking with Estimation
 
 Requirements :
@@ -6,10 +5,11 @@ Requirements :
 
 ## Compiling the project
 - In source code directory, create a build folder if not present.
-- Change directory to build directory, running `cd build` in terminal
+- Change directory to build directory, run `cd build` in terminal to move to build directory
 - Run cmake .. to generate make files
 - Run make to build the project
 ```
+mkdir build
 cd build
 cmake ..
 make
@@ -19,5 +19,5 @@ make
 - Application can take input from raw event data file or with available event camera
 - Run application with raw event data file from build directory
 ```
-./metavision_sdk_get_started5_opencl_store traffic_data.raw
+./metavision_time_surface_periodic_group_track traffic_data.raw
 ```
