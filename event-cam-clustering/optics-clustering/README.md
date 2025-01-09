@@ -44,7 +44,7 @@ Subsequently, you can use one of the following two alternative ways to install O
 ***Alternative 1:***  
 Clone this repository
 ```sh
-git clone https://github.com/CrikeeIP/OPTICS-Clustering
+git clone git@github.com:LogicTronixInc/Event-Camera-Clustering-and-Optical-Flow-Estimation.git
 ```
 and execute the the `install.sh` script delivered with it.
 
@@ -54,8 +54,8 @@ If you're uncomfortable running who-knows-what-they'll-do foreign scripts (and a
 2. Clone & install [FunctionalPlus](https://github.com/Dobiasd/FunctionalPlus) 
 3. Clone & install the OPTICS repository:
 ```sh
-git clone https://github.com/CrikeeIP/OPTICS-Clustering
-cd OPTICS-clustering
+git clone git@github.com:LogicTronixInc/Event-Camera-Clustering-and-Optical-Flow-Estimation.git
+cd event-cam-clustering/optics-clustering
 ./configure && make && make install
 ```
 
